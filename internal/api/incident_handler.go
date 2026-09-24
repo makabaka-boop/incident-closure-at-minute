@@ -36,6 +36,48 @@ type AdvanceRequest struct {
 	Minute int64 `json:"minute"`
 }
 
+// SimulateRequest is the payload accepted by
+// POST /incidents/{id}/simulate: the creation-time zero-based pipe indices
+// to hypothetically close immediately.
+type SimulateRequest struct {
+	ClosedPipes []int64 `json:"closed_pipes"`
+}
+
+// ArrivalChangeDTO describes one node's earliest arrival minute under the
+// baseline plan versus the shutdown plan; a null value means the plan does
+// not reach the node by the deadline.
+type ArrivalChangeDTO struct {
+	Node     int64  `json:"node"`
+	Baseline *int64 `json:"baseline"`
+	Shutdown *int64 `json:"shutdown"`
+}
+
+// IntakeSimulationDTO is the per-intake conclusion of a shutdown rehearsal.
+type IntakeSimulationDTO struct {
+	Node             int64  `json:"node"`
+	BaselineAt       *int64 `json:"baseline_at"`
+	ShutdownAt       *int64 `json:"shutdown_at"`
+	BaselineBreached bool   `json:"baseline_breached"`
+	ShutdownBreached bool   `json:"shutdown_breached"`
+}
+
+// SimulateResponse is the read-only shutdown rehearsal result, evaluated
+// against exactly one committed incident snapshot.
+type SimulateResponse struct {
+	EventMinute      int64                 `json:"event_minute"`
+	Status           string                `json:"status"`
+	ArrivedNodes     map[string]int64      `json:"arrived_nodes"`
+	Snapshot         SnapshotDTO           `json:"snapshot"`
+	ClosedPipes      []int64               `json:"closed_pipes"`
+	BaselineArrivals map[string]int64      `json:"baseline_arrivals"`
+	ShutdownArrivals map[string]int64      `json:"shutdown_arrivals"`
+	Changes          []ArrivalChangeDTO    `json:"changes"`
+	Intakes          []IntakeSimulationDTO `json:"intakes"`
+	BaselineStatus   string                `json:"baseline_status"`
+	ShutdownStatus   string                `json:"shutdown_status"`
+	Protected        bool                  `json:"protected"`
+}
+
 // ArrivalDTO is a node reached for the first time at a given minute.
 type ArrivalDTO struct {
 	Node     int64 `json:"node"`
@@ -171,6 +213,97 @@ func (s *server) handleAdvance(w http.ResponseWriter, r *http.Request) {
 		dto = append(dto, ArrivalDTO{Node: int64(a.Node), AtMinute: a.AtMinute})
 	}
 	writeJSON(w, http.StatusOK, AdvanceResponse{NewArrivals: dto, Snapshot: snapshotDTO(snap)})
+}
+
+func (s *server) handleSimulate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "use POST")
+		return
+	}
+	id := r.PathValue("id")
+	in, exists := s.incidents.Get(id)
+	if !exists {
+		writeError(w, http.StatusNotFound, "not_found", fmt.Sprintf("incident %q does not exist", id))
+		return
+	}
+	var req SimulateRequest
+	if !decodeStrict(w, r, &req) {
+		return
+	}
+	if req.ClosedPipes == nil {
+		// A missing field is the same as an explicit empty list: rehearse
+		// with no pipes closed.
+		req.ClosedPipes = []int64{}
+	}
+	sim, err := in.SimulateShutdown(req.ClosedPipes)
+	if err != nil {
+		var ve *incident.ValidationError
+		if errors.As(err, &ve) {
+			writeError(w, http.StatusUnprocessableEntity, "invalid_input", ve.Msg)
+			return
+		}
+		var ce *incident.ConflictError
+		detail := err.Error()
+		if errors.As(err, &ce) {
+			detail = ce.Detail
+		}
+		switch {
+		case errors.Is(err, incident.ErrTerminal):
+			writeError(w, http.StatusConflict, "incident_terminal", detail)
+		default:
+			writeError(w, http.StatusInternalServerError, "internal_error", "shutdown simulation failed")
+		}
+		return
+	}
+
+	snap := snapshotDTO(sim.Snapshot)
+	closed := make([]int64, 0, len(sim.ClosedPipes))
+	for _, idx := range sim.ClosedPipes {
+		closed = append(closed, int64(idx))
+	}
+	changes := make([]ArrivalChangeDTO, 0, len(sim.Changes))
+	for _, c := range sim.Changes {
+		changes = append(changes, ArrivalChangeDTO{
+			Node:     int64(c.Node),
+			Baseline: c.Baseline,
+			Shutdown: c.Shutdown,
+		})
+	}
+	intakes := make([]IntakeSimulationDTO, 0, len(sim.Intakes))
+	for _, it := range sim.Intakes {
+		intakes = append(intakes, IntakeSimulationDTO{
+			Node:             int64(it.Node),
+			BaselineAt:       it.BaselineAt,
+			ShutdownAt:       it.ShutdownAt,
+			BaselineBreached: it.BaselineBreached,
+			ShutdownBreached: it.ShutdownBreached,
+		})
+	}
+	writeJSON(w, http.StatusOK, SimulateResponse{
+		EventMinute:      sim.Snapshot.CurrentMinute,
+		Status:           string(sim.Snapshot.Status),
+		ArrivedNodes:     snap.EarliestArrivals,
+		Snapshot:         snap,
+		ClosedPipes:      closed,
+		BaselineArrivals: arrivalMapDTO(sim.BaselineArrivals),
+		ShutdownArrivals: arrivalMapDTO(sim.ShutdownArrivals),
+		Changes:          changes,
+		Intakes:          intakes,
+		BaselineStatus:   string(sim.BaselineStatus),
+		ShutdownStatus:   string(sim.ShutdownStatus),
+		Protected:        sim.Protected,
+	})
+}
+
+// arrivalMapDTO converts node-keyed arrival minutes into the string-keyed JSON
+// shape used by every incident response.
+func arrivalMapDTO(in map[int]int64) map[string]int64 {
+	out := make(map[string]int64, len(in))
+	for node, minute := range in {
+		out[fmt.Sprintf("%d", node)] = minute
+	}
+	return out
 }
 
 // buildSpec converts the request into a domain spec; it reports a stable 422

@@ -1,12 +1,15 @@
 # raincut — 暴雨管网最小关管成本与污染传播事件
 
-暴雨污染从供水入口（sources）沿管网流向取水口（sinks）。本服务提供两类能力：
+暴雨污染从供水入口（sources）沿管网流向取水口（sinks）。本服务提供三类能力：
 
 1. **最小关管成本**：计算阻断所有 source → sink 有向路径所需的最小关管总成本
    （有向图最小 s-t 割，`POST /mincut`）。
 2. **污染传播事件**：给定管网（管道有向通行分钟）、多个污染源与各自释放分钟、
    重点取水口与截止分钟，事件时钟可分段推进，返回本次首次到达节点、累计最早
    到达分钟与状态（`POST /incidents`、`POST /incidents/{id}/advance`）。
+3. **关管预演**：在事件推进到当前分钟时，只读地预演"立即关闭若干条管道"
+   能否保护重点取水口，不改写已经发生的传播
+   （`POST /incidents/{id}/simulate`）。
 
 ## 算法
 
@@ -98,7 +101,8 @@ curl -s -X POST http://localhost:8080/mincut \
 1. **屏障（accepting → draining）**：共享准入器（`internal/lifecycle`）在同一把
    锁下裁决"状态切换"与"租约授予"，二者构成同一线性化点。屏障前已取得租约的
    请求**完整执行到底**（即使请求体尚未发完）；屏障后的业务请求
-   （`/mincut`、`/incidents`、`/incidents/{id}/advance`）不再进入处理器、不改变
+   （`/mincut`、`/incidents`、`/incidents/{id}/advance`、
+   `/incidents/{id}/simulate`）不再进入处理器、不改变
    任何事件，稳定返回 `503 {"error":{"code":"draining",...}}`。`/healthz` 与
    `/readyz` 旁路准入器。
 2. **归零 → 关闭（draining → stopped）**：在 `DRAIN_TIMEOUT`（Go 时长或裸秒数，
@@ -208,6 +212,67 @@ curl -s -X POST http://localhost:8080/incidents/<id>/advance \
 # => new_arrivals 3@8，status=breached
 ```
 
+### `POST /incidents/{id}/simulate`
+
+**只读关管预演**：在事件推进到的当前分钟，预演"立即关闭若干条管道"能否
+保护重点取水口。请求体 `closed_pipes` 为创建事件时的管道**下标**（0 起，
+按 `pipes` 数组顺序；重复或越界下标返回 `422`）：
+
+```json
+{"closed_pipes": [1, 3]}
+```
+
+预演规则：
+
+- 以响应中 `event_minute`（事件当前时钟）为关管生效时刻；预演在**同一
+  事件快照**下记录当前分钟、已到达节点与传播状态（`snapshot` /
+  `arrived_nodes`），并发推进不会把两个状态拼进一份预演；
+- 关管只阻止**当前分钟及之后开始**的通行；当前分钟之前已进入管道的污染
+  仍在途，按原通行时间抵达（恰在当前分钟出发的通行被阻止）；
+- 当前分钟及之后的释放源照常生效；平行管按各自下标独立关闭；自环关闭
+  无效果；
+- 接口完全只读：事件时钟、首次到达记录与 `advance` 行为均不受任何影响。
+
+成功响应 `200`（示例：链 `0-2→1-2→2`，释放 `0@0`，取水口 `2`，截止 `10`，
+时钟在分钟 `2` 时关闭管道 `1`）：
+
+```json
+{
+  "event_minute": 2,
+  "status": "propagating",
+  "arrived_nodes": {"0": 0, "1": 2},
+  "snapshot": {"current_minute": 2, "status": "propagating",
+               "earliest_arrivals": {"0": 0, "1": 2}},
+  "closed_pipes": [1],
+  "baseline_arrivals": {"0": 0, "1": 2, "2": 4},
+  "shutdown_arrivals": {"0": 0, "1": 2},
+  "changes": [{"node": 2, "baseline": 4, "shutdown": null}],
+  "intakes": [{"node": 2, "baseline_at": 4, "shutdown_at": null,
+               "baseline_breached": true, "shutdown_breached": false}],
+  "baseline_status": "breached",
+  "shutdown_status": "contained",
+  "protected": true
+}
+```
+
+- `baseline_arrivals` / `shutdown_arrivals`：原方案与关管方案在**截止分钟
+  及之前**的各节点最早到达（不可达节点不出现）；
+- `changes`：到达时间发生变化的节点，按节点编号升序；`baseline` /
+  `shutdown` 为 `null` 表示该方案在截止前不可达；
+- `intakes`：每个重点取水口的到达分钟与是否被触达结论；
+- `baseline_status` / `shutdown_status`：两方案的截止结论（`breached` /
+  `contained`）；`protected=true` 表示关管方案下所有取水口在截止前均未
+  被触达。
+
+错误：未知事件 `404 not_found`；重复/越界下标 `422 invalid_input`（畸形
+JSON 为 `422 invalid_json`）；事件已到终态（`breached` / `contained`）
+返回 `409 incident_terminal`。所有拒绝都不会改变事件。
+
+```bash
+curl -s -X POST http://localhost:8080/incidents/<id>/simulate \
+  -H 'Content-Type: application/json' -d '{"closed_pipes": [1]}'
+```
+
 ## 验收内容（verify 服务）
 
 `cmd/verify` 是黑盒验收客户端，只调用真实 HTTP 接口（无假接口、无固定
@@ -226,6 +291,10 @@ curl -s -X POST http://localhost:8080/incidents/<id>/advance \
   并发请求只有一个提交携带增量；
 - `breached`（截止前触达取水口，恰在截止分钟也算）与 `contained`（到截止
   未触达）两类终态；
+- **关管预演**：平行管按下标独立关闭与改道、在途污染按原通行时间抵达、
+  恰在关闭分钟的出发被阻止、未来释放源照常生效、截止边界（恰在截止分钟
+  到达仍算触达）、自环关闭无效果；预演只读且基于同一事件快照；重复/越界
+  下标 `422`、终态事件 `409`、未知事件 `404`；
 - **优雅停机**：以真实子进程、半发送请求与真实 `SIGTERM`/`SIGINT` 复现正常与
   超时路径——屏障前取得租约的半发送请求补全请求体后完整执行并返回精确结果；
   屏障后业务请求稳定 `503 draining` 且不进入处理器；`/readyz` 在排空时返回
@@ -234,8 +303,8 @@ curl -s -X POST http://localhost:8080/incidents/<id>/advance \
 - `API_PORT` / `API_BASE_URL` 两种寻址方式都可用。
 
 verify 容器启动时先执行 `go test ./...`（含对小图与暴力枚举割的对拍、
-传播事件的状态机 / 幂等 / 并发单元测试，以及同规模大图测试），全部通过后
-再发起 HTTP 检查。
+传播事件的状态机 / 幂等 / 并发单元测试、关管预演与逐分钟模拟预言机的
+随机小图对拍，以及同规模大图测试），全部通过后再发起 HTTP 检查。
 
 ## 本地开发
 
@@ -251,10 +320,10 @@ API_PORT=8080 go run ./cmd/verify                        # 等价寻址方式
 ```
 cmd/api/       HTTP 服务入口（信号驱动的两阶段排空）
 cmd/verify/    一次性黑盒验收客户端（含排空验收：子进程 + 半发送请求 + 真实信号）
-internal/api/  路由、请求校验、错误结构（mincut + incidents）、准入屏障与探针
+internal/api/  路由、请求校验、错误结构（mincut + incidents + simulate）、准入屏障与探针
 internal/lifecycle/ 共享准入器：accepting → draining → stopped 与租约线性化裁决
 internal/flow/ 自实现 Dinic 最大流 / 最小割求解器
-internal/incident/ 多源最早到达（Dijkstra）、事件状态机与并发安全存储
+internal/incident/ 多源最早到达（Dijkstra）、事件状态机、关管预演与并发安全存储
 Dockerfile     多阶段构建（api 运行镜像 + verify 验收镜像）
 docker-compose.yml  api 与 verify 服务编排（API_PORT 控制宿主端口）
 ```

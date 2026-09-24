@@ -18,6 +18,12 @@
 // reports no new arrivals and the same snapshot; going backwards, past the
 // deadline, or advancing a terminal event is rejected and never mutates the
 // event.
+//
+// A non-terminal event also supports read-only shutdown rehearsals
+// (SimulateShutdown): against one committed snapshot, the rehearsal computes
+// how immediately closing a set of pipes (by creation-time index) would
+// change earliest arrivals within the deadline and whether the key intakes
+// would stay dry — without ever mutating the event.
 package incident
 
 import (
@@ -94,6 +100,59 @@ type Snapshot struct {
 	CurrentMinute    int64
 	Status           Status
 	EarliestArrivals map[int]int64
+}
+
+// ArrivalChange describes how one node's earliest arrival minute (within the
+// deadline) moves between the baseline plan and the shutdown plan. A nil
+// Baseline or Shutdown means the plan does not reach the node by the
+// deadline at all.
+type ArrivalChange struct {
+	Node     int
+	Baseline *int64
+	Shutdown *int64
+}
+
+// IntakeSimulation is the per-intake conclusion of a shutdown rehearsal:
+// when each plan first reaches the intake (nil = not by the deadline) and
+// whether that counts as a breach.
+type IntakeSimulation struct {
+	Node             int
+	BaselineAt       *int64
+	ShutdownAt       *int64
+	BaselineBreached bool
+	ShutdownBreached bool
+}
+
+// Simulation is the read-only result of rehearsing an immediate pipe
+// shutdown against one committed incident snapshot. It records the snapshot
+// the rehearsal was taken against (clock minute, status, nodes already
+// reached), both plans' earliest arrivals within the deadline, the per-node
+// changes and the intake conclusions. Nothing in a Simulation ever mutates
+// the incident.
+type Simulation struct {
+	// Snapshot is the committed incident state the rehearsal is based on.
+	Snapshot Snapshot
+	// ClosedPipes is the validated, sorted list of pipe indices that were
+	// hypothetically closed.
+	ClosedPipes []int
+	// BaselineArrivals and ShutdownArrivals are the earliest arrival
+	// minutes at or before the deadline under the original plan and under
+	// the shutdown plan (unreached nodes are absent).
+	BaselineArrivals map[int]int64
+	ShutdownArrivals map[int]int64
+	// Changes lists every node whose within-deadline arrival differs
+	// between the two plans, ordered by node id.
+	Changes []ArrivalChange
+	// Intakes lists the per-intake conclusions, ordered by node id.
+	Intakes []IntakeSimulation
+	// BaselineStatus and ShutdownStatus are the intake conclusions of each
+	// plan: Breached if any intake is reached by the deadline, Contained
+	// otherwise.
+	BaselineStatus Status
+	ShutdownStatus Status
+	// Protected reports whether the shutdown plan keeps every intake
+	// unreached until the deadline.
+	Protected bool
 }
 
 // ValidationError marks a spec that must never be accepted; the HTTP layer
@@ -390,6 +449,219 @@ func (in *Incident) Advance(target int64) ([]Arrival, Snapshot, error) {
 	in.current = target
 	in.status = in.statusAt(target)
 	return newArrivals, in.snapshotLocked(), nil
+}
+
+// SimulateShutdown runs a read-only rehearsal of immediately closing the
+// pipes with the given creation-time pipe indices, evaluated against the
+// incident's committed snapshot. Closing a pipe only stops traversals that
+// would start at the snapshot minute or later: pollution that entered a
+// closed pipe strictly earlier keeps travelling with its original traversal
+// time and arrives as before. Releases at or after the snapshot minute seed
+// normally; parallel pipes are handled by their own indices and closing one
+// never closes the others.
+//
+// Repeated or out-of-range pipe indices return a *ValidationError, and a
+// terminal event returns ErrTerminal; every rejection leaves the incident
+// untouched. The incident is never mutated by a successful rehearsal either.
+func (in *Incident) SimulateShutdown(closedIndices []int64) (Simulation, error) {
+	closed := make([]bool, len(in.spec.Pipes))
+	firstUse := make(map[int]int, len(closedIndices))
+	sorted := make([]int, 0, len(closedIndices))
+	for i, raw := range closedIndices {
+		if raw < 0 || raw >= int64(len(in.spec.Pipes)) {
+			return Simulation{}, &ValidationError{fmt.Sprintf(
+				"closed_pipes[%d]=%d is out of range [0,%d)", i, raw, len(in.spec.Pipes))}
+		}
+		idx := int(raw)
+		if closed[idx] {
+			return Simulation{}, &ValidationError{fmt.Sprintf(
+				"closed_pipes[%d]=%d duplicates closed_pipes[%d]", i, idx, firstUse[idx])}
+		}
+		closed[idx] = true
+		firstUse[idx] = i
+		sorted = append(sorted, idx)
+	}
+	sort.Ints(sorted)
+
+	// Capture the committed snapshot under the incident lock so a rehearsal
+	// can never combine two different advancing states. The read-only
+	// computation itself runs outside the lock, over immutable spec/static
+	// distance data and local copies.
+	in.mu.Lock()
+	if in.status.Terminal() {
+		status := in.status
+		in.mu.Unlock()
+		return Simulation{}, conflict(ErrTerminal,
+			fmt.Sprintf("incident already reached terminal status %q", status))
+	}
+	snap := in.snapshotLocked()
+	current := in.current
+	in.mu.Unlock()
+
+	simDist := shutdownArrivals(in.spec, in.dist, current, closed)
+	baseline := arrivalsAtOrBefore(in.dist, in.spec.Deadline)
+	shutdown := arrivalsAtOrBefore(simDist, in.spec.Deadline)
+
+	changes := make([]ArrivalChange, 0)
+	for v := 0; v < in.spec.N; v++ {
+		b, bok := baseline[v]
+		s, sok := shutdown[v]
+		if bok && sok && b == s {
+			continue
+		}
+		change := ArrivalChange{Node: v}
+		if bok {
+			bv := b
+			change.Baseline = &bv
+		}
+		if sok {
+			sv := s
+			change.Shutdown = &sv
+		}
+		changes = append(changes, change)
+	}
+
+	intakes := append([]int(nil), in.intakes...)
+	sort.Ints(intakes)
+	results := make([]IntakeSimulation, 0, len(intakes))
+	anyShutdownBreach := false
+	for _, id := range intakes {
+		r := IntakeSimulation{Node: id}
+		if d := in.dist[id]; d <= in.spec.Deadline {
+			dv := d
+			r.BaselineAt = &dv
+			r.BaselineBreached = true
+		}
+		if d := simDist[id]; d <= in.spec.Deadline {
+			dv := d
+			r.ShutdownAt = &dv
+			r.ShutdownBreached = true
+			anyShutdownBreach = true
+		}
+		results = append(results, r)
+	}
+
+	return Simulation{
+		Snapshot:         snap,
+		ClosedPipes:      sorted,
+		BaselineArrivals: baseline,
+		ShutdownArrivals: shutdown,
+		Changes:          changes,
+		Intakes:          results,
+		BaselineStatus:   statusOutcome(in.dist, in.intakes, in.spec.Deadline),
+		ShutdownStatus:   statusOutcome(simDist, in.intakes, in.spec.Deadline),
+		Protected:        !anyShutdownBreach,
+	}, nil
+}
+
+// statusOutcome reports the deadline conclusion for one plan: Breached if any
+// intake is reached at or before the deadline, Contained otherwise.
+func statusOutcome(dist []int64, intakes []int, deadline int64) Status {
+	for _, id := range intakes {
+		if dist[id] <= deadline {
+			return Breached
+		}
+	}
+	return Contained
+}
+
+// arrivalsAtOrBefore returns the arrival entries with d <= cutoff. Entries
+// with d == math.MaxInt64 (unreachable) never satisfy the bound because the
+// deadline itself is capped at MaxMinutes.
+func arrivalsAtOrBefore(dist []int64, cutoff int64) map[int]int64 {
+	out := make(map[int]int64)
+	for v, d := range dist {
+		if d <= cutoff {
+			out[v] = d
+		}
+	}
+	return out
+}
+
+// shutdownArrivals computes earliest arrivals under a hypothetical pipe
+// shutdown starting at minute current.
+//
+// Seeds are threefold:
+//  1. Every node the baseline already reached by current (pollution present
+//     at that node at the recorded minute).
+//  2. The in-transit payload of each closed pipe whose traversal started
+//     strictly before current: it still arrives at base[from]+minutes, even
+//     though the pipe is now closed.
+//  3. Every release happening at or after current; future releases behave
+//     exactly as in the original plan.
+//
+// Closed pipes are then removed from the graph and multi-source Dijkstra
+// propagates the seeds along the still-open pipes. Self-loops are never
+// traversed, and parallel pipes are separate arcs, so closing an index
+// affects only that single pipe.
+func shutdownArrivals(spec Spec, base []int64, current int64, closed []bool) []int64 {
+	inf := int64(math.MaxInt64)
+	dist := make([]int64, spec.N)
+	for i := range dist {
+		dist[i] = inf
+	}
+	adj := make([][]adjEdge, spec.N)
+	for i, p := range spec.Pipes {
+		if p.From == p.To || closed[i] {
+			continue
+		}
+		adj[p.From] = append(adj[p.From], adjEdge{p.To, p.Minutes})
+	}
+
+	queue := make(pq, 0)
+	seed := func(v int, d int64) {
+		if d < dist[v] {
+			dist[v] = d
+			queue = append(queue, pqItem{v, d})
+		}
+	}
+
+	// 1. Pollution already present at a node at or before the shutdown
+	// minute. Such a node's outgoing traversals starting at current are
+	// governed by the open/closed graph below (an arrival exactly at current
+	// departs exactly at current, and closed pipes block that departure).
+	for v, d := range base {
+		if d <= current {
+			seed(v, d)
+		}
+	}
+
+	// 2. Traversals that entered a now-closed pipe strictly before current
+	// are already in flight and still arrive with their original traversal
+	// time. Arrivals at or before current are already covered by seed set 1.
+	for i, p := range spec.Pipes {
+		if !closed[i] || p.From == p.To {
+			continue
+		}
+		departed := base[p.From]
+		if departed >= current {
+			continue // departure at current or later is blocked
+		}
+		seed(p.To, departed+p.Minutes)
+	}
+
+	// 3. Future releases seed normally.
+	for _, r := range spec.Releases {
+		if r.At >= current {
+			seed(r.Node, r.At)
+		}
+	}
+
+	heap.Init(&queue)
+	for queue.Len() > 0 {
+		cur := heap.Pop(&queue).(pqItem)
+		if cur.d != dist[cur.v] {
+			continue
+		}
+		for _, e := range adj[cur.v] {
+			nd := cur.d + e.w
+			if nd < dist[e.to] {
+				dist[e.to] = nd
+				heap.Push(&queue, pqItem{e.to, nd})
+			}
+		}
+	}
+	return dist
 }
 
 // Store is the in-memory collection of incidents. The map lock only guards

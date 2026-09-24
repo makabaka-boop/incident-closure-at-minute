@@ -112,6 +112,250 @@ type errorResponse struct {
 	} `json:"error"`
 }
 
+// ---------------------------------------------------------------------------
+// shutdown simulation payloads
+// ---------------------------------------------------------------------------
+
+type simulateRequest struct {
+	ClosedPipes []int64 `json:"closed_pipes"`
+}
+
+type arrivalChange struct {
+	Node     int64  `json:"node"`
+	Baseline *int64 `json:"baseline"`
+	Shutdown *int64 `json:"shutdown"`
+}
+
+type intakeSimulation struct {
+	Node             int64  `json:"node"`
+	BaselineAt       *int64 `json:"baseline_at"`
+	ShutdownAt       *int64 `json:"shutdown_at"`
+	BaselineBreached bool   `json:"baseline_breached"`
+	ShutdownBreached bool   `json:"shutdown_breached"`
+}
+
+type simulateResponse struct {
+	EventMinute      int64              `json:"event_minute"`
+	Status           string             `json:"status"`
+	ArrivedNodes     map[string]int64   `json:"arrived_nodes"`
+	Snapshot         snapshotDTO        `json:"snapshot"`
+	ClosedPipes      []int64            `json:"closed_pipes"`
+	BaselineArrivals map[string]int64   `json:"baseline_arrivals"`
+	ShutdownArrivals map[string]int64   `json:"shutdown_arrivals"`
+	Changes          []arrivalChange    `json:"changes"`
+	Intakes          []intakeSimulation `json:"intakes"`
+	BaselineStatus   string             `json:"baseline_status"`
+	ShutdownStatus   string             `json:"shutdown_status"`
+	Protected        bool               `json:"protected"`
+}
+
+// simulate posts a shutdown rehearsal and returns the raw result.
+func simulate(id string, closed []int64) (int, []byte) {
+	status, body, err := postJSON("/incidents/"+id+"/simulate", simulateRequest{ClosedPipes: closed})
+	if err != nil {
+		return -1, []byte(err.Error())
+	}
+	return status, body
+}
+
+func mustSimulate(name, id string, closed []int64) simulateResponse {
+	status, body := simulate(id, closed)
+	if status != http.StatusOK {
+		fail(name, "status %d, want 200, body %s", status, body)
+		return simulateResponse{}
+	}
+	var resp simulateResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		fail(name, "response not JSON: %v (%s)", err, body)
+		return simulateResponse{}
+	}
+	return resp
+}
+
+func changesEqual(got []arrivalChange, want []arrivalChange) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		g, w := got[i], want[i]
+		if g.Node != w.Node {
+			return false
+		}
+		if (g.Baseline == nil) != (w.Baseline == nil) || (g.Shutdown == nil) != (w.Shutdown == nil) {
+			return false
+		}
+		if g.Baseline != nil && *g.Baseline != *w.Baseline {
+			return false
+		}
+		if g.Shutdown != nil && *g.Shutdown != *w.Shutdown {
+			return false
+		}
+	}
+	return true
+}
+
+func i64(v int64) *int64 { return &v }
+
+// verifyShutdownSimulation exercises the read-only pipe-shutdown rehearsal:
+// exact rerouting over parallel pipes, in-transit payload preservation,
+// intake conclusions, stable rejections and the read-only guarantee.
+func verifyShutdownSimulation() {
+	// Parallel pipes 0->1 (idx 0: 2 min, idx 1: 5 min), then 1->2 (idx 2)
+	// and 2->3 (idx 3). Release 0@0, intake 3, deadline 10. Baseline
+	// arrivals: 0@0, 1@2, 2@4, 3@6 -> breached.
+	req := incidentRequest{
+		N:        4,
+		Pipes:    []pipe{{0, 1, 2}, {0, 1, 5}, {1, 2, 2}, {2, 3, 2}},
+		Releases: []release{{0, 0}},
+		Intakes:  []int64{3},
+		Deadline: 10,
+	}
+	id := createIncident("simulate: create event for shutdown rehearsal", req)
+	if id == "" {
+		return
+	}
+	if !checkStep("simulate: clock commits to minute 0", id, 0, "propagating", []arrival{{0, 0}}) {
+		return
+	}
+
+	// Close the fast parallel pipe at minute 0: the departure from node 0
+	// is blocked, so the flow reroutes over the slow parallel pipe:
+	// 1@5, 2@7, 3@9 — still a breach, but three minutes later.
+	resp := mustSimulate("simulate: reroute over the slow parallel pipe", id, []int64{0})
+	if resp.EventMinute != 0 || resp.Status != "propagating" ||
+		resp.Snapshot.CurrentMinute != 0 || resp.Snapshot.Status != "propagating" {
+		fail("simulate: reroute over the slow parallel pipe",
+			"event minute/status=%d/%s snapshot=%+v, want 0/propagating",
+			resp.EventMinute, resp.Status, resp.Snapshot)
+		return
+	}
+	if !mapsEqual(resp.ArrivedNodes, map[string]int64{"0": 0}) {
+		fail("simulate: reroute over the slow parallel pipe", "arrived_nodes=%v, want {0:0}", resp.ArrivedNodes)
+		return
+	}
+	if !mapsEqual(resp.BaselineArrivals, map[string]int64{"0": 0, "1": 2, "2": 4, "3": 6}) {
+		fail("simulate: reroute over the slow parallel pipe", "baseline=%v", resp.BaselineArrivals)
+		return
+	}
+	if !mapsEqual(resp.ShutdownArrivals, map[string]int64{"0": 0, "1": 5, "2": 7, "3": 9}) {
+		fail("simulate: reroute over the slow parallel pipe", "shutdown=%v, want {0:0,1:5,2:7,3:9}", resp.ShutdownArrivals)
+		return
+	}
+	wantChanges := []arrivalChange{
+		{Node: 1, Baseline: i64(2), Shutdown: i64(5)},
+		{Node: 2, Baseline: i64(4), Shutdown: i64(7)},
+		{Node: 3, Baseline: i64(6), Shutdown: i64(9)},
+	}
+	if !changesEqual(resp.Changes, wantChanges) {
+		fail("simulate: reroute over the slow parallel pipe", "changes=%+v, want %+v", resp.Changes, wantChanges)
+		return
+	}
+	if resp.BaselineStatus != "breached" || resp.ShutdownStatus != "breached" || resp.Protected {
+		fail("simulate: reroute over the slow parallel pipe",
+			"conclusions=%s/%s protected=%v, want breached/breached/false",
+			resp.BaselineStatus, resp.ShutdownStatus, resp.Protected)
+		return
+	}
+	if len(resp.Intakes) != 1 || resp.Intakes[0].Node != 3 ||
+		resp.Intakes[0].BaselineAt == nil || *resp.Intakes[0].BaselineAt != 6 ||
+		resp.Intakes[0].ShutdownAt == nil || *resp.Intakes[0].ShutdownAt != 9 ||
+		!resp.Intakes[0].BaselineBreached || !resp.Intakes[0].ShutdownBreached {
+		fail("simulate: reroute over the slow parallel pipe", "intakes=%+v", resp.Intakes)
+		return
+	}
+	pass("simulate: closing one parallel pipe reroutes over the other (1@5, 2@7, 3@9)")
+
+	// Close both parallel pipes (unsorted input, sorted echo): node 1 is
+	// cut off entirely and the intake is protected.
+	resp = mustSimulate("simulate: closing every parallel pipe", id, []int64{1, 0})
+	if len(resp.ClosedPipes) != 2 || resp.ClosedPipes[0] != 0 || resp.ClosedPipes[1] != 1 {
+		fail("simulate: closing every parallel pipe", "closed_pipes=%v, want [0 1]", resp.ClosedPipes)
+		return
+	}
+	if !mapsEqual(resp.ShutdownArrivals, map[string]int64{"0": 0}) {
+		fail("simulate: closing every parallel pipe", "shutdown=%v, want {0:0}", resp.ShutdownArrivals)
+		return
+	}
+	if resp.ShutdownStatus != "contained" || !resp.Protected {
+		fail("simulate: closing every parallel pipe",
+			"shutdown_status=%s protected=%v, want contained/true",
+			resp.ShutdownStatus, resp.Protected)
+		return
+	}
+	wantChanges = []arrivalChange{
+		{Node: 1, Baseline: i64(2)},
+		{Node: 2, Baseline: i64(4)},
+		{Node: 3, Baseline: i64(6)},
+	}
+	if !changesEqual(resp.Changes, wantChanges) {
+		fail("simulate: closing every parallel pipe", "changes=%+v, want baseline-only entries", resp.Changes)
+		return
+	}
+	pass("simulate: closing every parallel pipe protects the intake")
+
+	// The rehearsal is read-only: the next real advance sees exactly the
+	// arrivals between minute 0 and 2.
+	if !checkStep("simulate: rehearsal never mutates the event", id, 2, "propagating", []arrival{{1, 2}}) {
+		return
+	}
+
+	// At minute 3 the payload of pipe 2 (1->2) is already in flight (it
+	// departed at minute 2). Closing pipe 2 now cannot recall it: node 2
+	// still arrives at 4 and node 3 at 6, so nothing changes.
+	if !checkStep("simulate: advance into the in-transit window", id, 3, "propagating", []arrival{}) {
+		return
+	}
+	resp = mustSimulate("simulate: in-transit payload survives the closure", id, []int64{2})
+	if len(resp.Changes) != 0 || !mapsEqual(resp.ShutdownArrivals, resp.BaselineArrivals) {
+		fail("simulate: in-transit payload survives the closure",
+			"changes=%+v shutdown=%v baseline=%v, want no change",
+			resp.Changes, resp.ShutdownArrivals, resp.BaselineArrivals)
+		return
+	}
+	pass("simulate: in-transit payload keeps its original traversal time")
+
+	// Duplicate and out-of-range pipe indices are stable 422s; a malformed
+	// body is rejected the same way.
+	expect422Raw("simulate: duplicate pipe index", "/incidents/"+id+"/simulate",
+		[]byte(`{"closed_pipes":[0,0]}`))
+	expect422Raw("simulate: pipe index out of range", "/incidents/"+id+"/simulate",
+		[]byte(`{"closed_pipes":[4]}`))
+	expect422Raw("simulate: negative pipe index", "/incidents/"+id+"/simulate",
+		[]byte(`{"closed_pipes":[-1]}`))
+	expect422Raw("simulate: malformed body", "/incidents/"+id+"/simulate",
+		[]byte(`{"closed_pipes":[0,`))
+
+	// Unknown event -> stable 404.
+	status, body := simulate("inc_does_not_exist", []int64{0})
+	if status != http.StatusNotFound {
+		fail("simulate: unknown id", "status %d, want 404, body %s", status, body)
+		return
+	}
+	var er errorResponse
+	if err := json.Unmarshal(body, &er); err != nil || er.Error.Code != "not_found" {
+		fail("simulate: unknown id", "body=%s", body)
+		return
+	}
+	pass("simulate: unknown id is a stable 404")
+
+	// Once the event is terminal, rehearsals are rejected with a stable
+	// 409 and the event is left untouched.
+	if !checkStep("simulate: drive the event to its terminal breach", id, 6, "breached",
+		[]arrival{{2, 4}, {3, 6}}) {
+		return
+	}
+	status, body = simulate(id, []int64{0})
+	if status != http.StatusConflict {
+		fail("simulate: terminal event", "status %d, want 409, body %s", status, body)
+		return
+	}
+	if err := json.Unmarshal(body, &er); err != nil || er.Error.Code != "incident_terminal" {
+		fail("simulate: terminal event", "body=%s, want incident_terminal", body)
+		return
+	}
+	pass("simulate: terminal event rejects rehearsals with a stable 409")
+}
+
 var failures int
 
 func pass(name string) { fmt.Printf("[PASS] %s\n", name) }
@@ -829,6 +1073,7 @@ func main() {
 	verifyIncidentLifecycle()
 	verifyContained()
 	verifyMultiSource()
+	verifyShutdownSimulation()
 	verifyErrors()
 	verifyConcurrentAdvances()
 	verifyLargeIncident()
