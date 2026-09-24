@@ -1,0 +1,13 @@
+# Build artifacts
+/api
+/verify
+/bin/
+*.exe
+*.test
+*.out
+coverage.txt
+
+# Editor / OS noise
+.idea/
+.vscode/
+.DS_Store
