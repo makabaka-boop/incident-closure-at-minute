@@ -180,8 +180,9 @@ func Validate(s Spec) error {
 
 // adjEdge is a forward traversal arc. Only forward arcs are ever built.
 type adjEdge struct {
-	to int
-	w  int64
+	to   int
+	w    int64
+	pipe int
 }
 
 // pqItem is a priority-queue candidate: node v at tentative distance d.
@@ -203,34 +204,31 @@ func (p *pq) Pop() any {
 	return last
 }
 
-// earliestArrivals runs the multi-source Dijkstra relaxation. Each release
-// seeds its node with its release minute (the earliest seed at a node wins),
-// then every directed pipe relaxes arrival by traversal time. Self-loops are
-// not inserted (they can never move contamination anywhere) and there are no
-// reverse arcs, so neither can produce propagation. It returns the earliest
-// arrival minute per node (math.MaxInt64 when unreachable) and the minute of
-// the first release.
-func earliestArrivals(s Spec) ([]int64, int64) {
+// buildAdjacency keeps every non-self-loop directed pipe. Parallel pipes
+// remain separate arcs because they are closed independently by index.
+func buildAdjacency(s Spec) [][]adjEdge {
+	adj := make([][]adjEdge, s.N)
+	for i, p := range s.Pipes {
+		if p.From == p.To {
+			continue // a self-loop can never carry contamination to a new node
+		}
+		adj[p.From] = append(adj[p.From], adjEdge{to: p.To, w: p.Minutes, pipe: i})
+	}
+	return adj
+}
+
+// runDijkstra propagates the supplied seed minutes over the graph. It is used
+// both for the immutable original schedule and for a hypothetical shutdown.
+func runDijkstra(s Spec, adj [][]adjEdge, seeds map[int]int64) []int64 {
 	inf := int64(math.MaxInt64)
 	dist := make([]int64, s.N)
 	for i := range dist {
 		dist[i] = inf
 	}
-	adj := make([][]adjEdge, s.N)
-	for _, p := range s.Pipes {
-		if p.From == p.To {
-			continue // a self-loop can never carry contamination to a new node
-		}
-		adj[p.From] = append(adj[p.From], adjEdge{p.To, p.Minutes})
-	}
-	first := inf
-	queue := make(pq, 0, len(s.Releases))
-	for _, r := range s.Releases {
-		if r.At < first {
-			first = r.At
-		}
-		if r.At < dist[r.Node] {
-			dist[r.Node] = r.At
+	queue := make(pq, 0, len(seeds))
+	for v, d := range seeds {
+		if d < dist[v] {
+			dist[v] = d
 		}
 	}
 	for v := 0; v < s.N; v++ {
@@ -252,7 +250,31 @@ func earliestArrivals(s Spec) ([]int64, int64) {
 			}
 		}
 	}
-	return dist, first
+	return dist
+}
+
+// earliestArrivals runs the multi-source Dijkstra relaxation. Each release
+// seeds its node with its release minute (the earliest seed at a node wins),
+// then every directed pipe relaxes arrival by traversal time. Self-loops are
+// not inserted (they can never move contamination anywhere) and there are no
+// reverse arcs, so neither can produce propagation. It returns the forward
+// graph, the earliest arrival minute per node (math.MaxInt64 when unreachable)
+// and the minute of the first release.
+func earliestArrivals(s Spec) ([][]adjEdge, []int64, int64) {
+	inf := int64(math.MaxInt64)
+	adj := buildAdjacency(s)
+	seeds := make(map[int]int64, len(s.Releases))
+	first := inf
+	for _, r := range s.Releases {
+		if r.At < first {
+			first = r.At
+		}
+		if d, ok := seeds[r.Node]; !ok || r.At < d {
+			seeds[r.Node] = r.At
+		}
+	}
+	dist := runDijkstra(s, adj, seeds)
+	return adj, dist, first
 }
 
 // Incident is a stored event. Its methods are safe for concurrent use: every
@@ -262,7 +284,8 @@ func earliestArrivals(s Spec) ([]int64, int64) {
 type Incident struct {
 	id       string
 	spec     Spec
-	dist     []int64 // static earliest arrival per node
+	adj      [][]adjEdge // forward graph; parallel pipes retain their own index
+	dist     []int64     // static earliest arrival per node
 	isIntake []bool
 	intakes  []int // de-duplicated intake nodes
 	first    int64 // minute of the first release
@@ -279,7 +302,7 @@ func NewIncident(spec Spec) (*Incident, error) {
 	if err := Validate(spec); err != nil {
 		return nil, err
 	}
-	dist, first := earliestArrivals(spec)
+	adj, dist, first := earliestArrivals(spec)
 	isIntake := make([]bool, spec.N)
 	intakes := make([]int, 0, len(spec.Intakes))
 	for _, id := range spec.Intakes {
@@ -290,6 +313,7 @@ func NewIncident(spec Spec) (*Incident, error) {
 	}
 	return &Incident{
 		spec:     spec,
+		adj:      adj,
 		dist:     dist,
 		isIntake: isIntake,
 		intakes:  intakes,
@@ -385,11 +409,229 @@ func (in *Incident) Advance(target int64) ([]Arrival, Snapshot, error) {
 		}
 		return newArrivals[i].Node < newArrivals[j].Node
 	})
-
 	in.started = true
 	in.current = target
 	in.status = in.statusAt(target)
 	return newArrivals, in.snapshotLocked(), nil
+}
+
+// PlanProjection is a read-only prediction through the deadline under either
+// the original pipe set or the hypothetical immediately-closed pipe set.
+type PlanProjection struct {
+	Status           Status
+	EarliestArrivals map[int]int64
+}
+
+// ArrivalChange compares the two plans for one node. A nil minute means that
+// contamination cannot reach the node by the deadline.
+type ArrivalChange struct {
+	Node            int
+	OriginalArrival *int64
+	ShutdownArrival *int64
+}
+
+// IntakeConclusion compares the earliest arrival at one key intake and states
+// whether the shutdown plan protects it through the deadline.
+type IntakeConclusion struct {
+	Node              int
+	OriginalArrival   *int64
+	ShutdownArrival   *int64
+	ShutdownProtected bool
+}
+
+// ShutdownPreview is an immutable read-only result. Its snapshot is the one
+// committed event state used for the whole calculation; the event clock and
+// first-arrival record are never modified.
+type ShutdownPreview struct {
+	EventMinute         int64
+	Snapshot            Snapshot
+	ClosedPipeIndices   []int
+	Original            PlanProjection
+	Shutdown            PlanProjection
+	ArrivalChanges      []ArrivalChange
+	IntakeConclusions   []IntakeConclusion
+	AllIntakesProtected bool
+}
+
+// PreviewShutdown computes what would happen if the named pipes were closed
+// immediately at the currently committed event minute. Pipes whose original
+// traversal began before that minute remain in flight and still arrive on
+// their original schedule. Every traversal beginning at or after the minute is
+// blocked on a selected pipe; future releases are still made and all other
+// pipes, including parallel pipes with different indices, remain open.
+//
+// The method is read-only. Duplicate or out-of-range pipe indices are 422
+// validation errors; a terminal incident is a 409 incident_terminal conflict.
+func (in *Incident) PreviewShutdown(indices []int) (ShutdownPreview, error) {
+	if err := validateClosedPipes(len(in.spec.Pipes), indices); err != nil {
+		return ShutdownPreview{}, err
+	}
+
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	if in.status.Terminal() {
+		return ShutdownPreview{}, conflict(ErrTerminal,
+			fmt.Sprintf("incident already reached terminal status %q", in.status))
+	}
+
+	t := in.current
+	closedSet := make(map[int]bool, len(indices))
+	for _, i := range indices {
+		closedSet[i] = true
+	}
+	closed := make([]int, 0, len(indices))
+	closed = append(closed, indices...)
+	sort.Ints(closed)
+
+	openAdj := make([][]adjEdge, in.spec.N)
+	for u, arcs := range in.adj {
+		for _, e := range arcs {
+			if !closedSet[e.pipe] {
+				openAdj[u] = append(openAdj[u], e)
+			}
+		}
+	}
+
+	seeds := make(map[int]int64)
+
+	// Everything already reached in the committed event cannot be un-reached.
+	// Its original arrival time is also the earliest possible contamination
+	// time available to still-open outgoing pipes.
+	for v, d := range in.dist {
+		if d <= t {
+			seeds[v] = d
+		}
+	}
+
+	// Releases occurring at or after the shutdown minute are still made, but
+	// a selected pipe blocks their traversals starting at that minute.
+	for _, r := range in.spec.Releases {
+		if r.At >= t {
+			if d, ok := seeds[r.Node]; !ok || r.At < d {
+				seeds[r.Node] = r.At
+			}
+		}
+	}
+
+	// A selected pipe only blocks departures at t or later. If pollution
+	// reached its tail before t, that packet entered the pipe before shutdown
+	// and is injected at its unchanged downstream arrival minute.
+	for _, i := range closed {
+		p := in.spec.Pipes[i]
+		if p.From == p.To {
+			continue // self-loops are not part of the propagation graph
+		}
+		if in.dist[p.From] < t {
+			arrival := in.dist[p.From] + p.Minutes
+			if d, ok := seeds[p.To]; !ok || arrival < d {
+				seeds[p.To] = arrival
+			}
+		}
+	}
+
+	shutdownDist := runDijkstra(in.spec, openAdj, seeds)
+	snap := in.snapshotLocked()
+	original := projectPlan(in.dist, in.intakes, in.spec.Deadline)
+	shutdown := projectPlan(shutdownDist, in.intakes, in.spec.Deadline)
+
+	changes := make([]ArrivalChange, 0)
+	for v := 0; v < in.spec.N; v++ {
+		var originalArrival, shutdownArrival *int64
+		if in.dist[v] <= in.spec.Deadline {
+			d := in.dist[v]
+			originalArrival = &d
+		}
+		if shutdownDist[v] <= in.spec.Deadline {
+			d := shutdownDist[v]
+			shutdownArrival = &d
+		}
+		if !sameArrival(originalArrival, shutdownArrival) {
+			changes = append(changes, ArrivalChange{
+				Node:            v,
+				OriginalArrival: originalArrival,
+				ShutdownArrival: shutdownArrival,
+			})
+		}
+	}
+	sort.Slice(changes, func(i, j int) bool { return changes[i].Node < changes[j].Node })
+
+	conclusions := make([]IntakeConclusion, 0, len(in.intakes))
+	allProtected := true
+	for _, node := range in.intakes {
+		var originalArrival, shutdownArrival *int64
+		if in.dist[node] <= in.spec.Deadline {
+			d := in.dist[node]
+			originalArrival = &d
+		}
+		if shutdownDist[node] <= in.spec.Deadline {
+			d := shutdownDist[node]
+			shutdownArrival = &d
+		}
+		protected := shutdownArrival == nil
+		if !protected {
+			allProtected = false
+		}
+		conclusions = append(conclusions, IntakeConclusion{
+			Node:              node,
+			OriginalArrival:   originalArrival,
+			ShutdownArrival:   shutdownArrival,
+			ShutdownProtected: protected,
+		})
+	}
+	sort.Slice(conclusions, func(i, j int) bool { return conclusions[i].Node < conclusions[j].Node })
+
+	return ShutdownPreview{
+		EventMinute:         t,
+		Snapshot:            snap,
+		ClosedPipeIndices:   closed,
+		Original:            original,
+		Shutdown:            shutdown,
+		ArrivalChanges:      changes,
+		IntakeConclusions:   conclusions,
+		AllIntakesProtected: allProtected,
+	}, nil
+}
+
+func validateClosedPipes(pipeCount int, indices []int) error {
+	seen := make(map[int]bool, len(indices))
+	for _, i := range indices {
+		if i < 0 || i >= pipeCount {
+			return &ValidationError{fmt.Sprintf("closed pipe index %d is out of range [0,%d)", i, pipeCount)}
+		}
+		if seen[i] {
+			return &ValidationError{fmt.Sprintf("closed pipe index %d appears more than once", i)}
+		}
+		seen[i] = true
+	}
+	return nil
+}
+
+func projectPlan(dist []int64, intakes []int, deadline int64) PlanProjection {
+	arrivals := make(map[int]int64)
+	breached := false
+	for v, d := range dist {
+		if d <= deadline {
+			arrivals[v] = d
+		}
+	}
+	for _, node := range intakes {
+		if dist[node] <= deadline {
+			breached = true
+			break
+		}
+	}
+	status := Contained
+	if breached {
+		status = Breached
+	}
+	return PlanProjection{Status: status, EarliestArrivals: arrivals}
+}
+
+func sameArrival(a, b *int64) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
 }
 
 // Store is the in-memory collection of incidents. The map lock only guards

@@ -105,6 +105,39 @@ type advanceResponse struct {
 	Snapshot    snapshotDTO `json:"snapshot"`
 }
 
+type shutdownPreviewRequest struct {
+	ClosedPipeIndices []int64 `json:"closed_pipe_indices"`
+}
+
+type planProjection struct {
+	Status           string           `json:"status"`
+	EarliestArrivals map[string]int64 `json:"earliest_arrivals"`
+}
+
+type arrivalChange struct {
+	Node            int64  `json:"node"`
+	OriginalArrival *int64 `json:"original_arrival_minute"`
+	ShutdownArrival *int64 `json:"shutdown_arrival_minute"`
+}
+
+type intakeConclusion struct {
+	Node              int64  `json:"node"`
+	OriginalArrival   *int64 `json:"original_arrival_minute"`
+	ShutdownArrival   *int64 `json:"shutdown_arrival_minute"`
+	ShutdownProtected bool   `json:"shutdown_protected"`
+}
+
+type shutdownPreviewResponse struct {
+	EventMinute         int64              `json:"event_minute"`
+	Snapshot            snapshotDTO        `json:"snapshot"`
+	ClosedPipeIndices   []int64            `json:"closed_pipe_indices"`
+	Original            planProjection     `json:"original_plan"`
+	Shutdown            planProjection     `json:"shutdown_plan"`
+	ArrivalChanges      []arrivalChange    `json:"arrival_changes"`
+	IntakeConclusions   []intakeConclusion `json:"intake_conclusions"`
+	AllIntakesProtected bool               `json:"all_intakes_protected"`
+}
+
 type errorResponse struct {
 	Error struct {
 		Code    string `json:"code"`
@@ -493,6 +526,165 @@ func verifyMultiSource() {
 	}
 }
 
+func shutdownPreview(id string, indices []int64) (int, []byte, error) {
+	return postJSON("/incidents/"+id+"/shutdown-preview", shutdownPreviewRequest{ClosedPipeIndices: indices})
+}
+
+func verifyShutdownPreview() {
+	// Index layout matters:
+	//   0: 0 -> 1, 2 minutes
+	//   1: 1 -> 2, 2 minutes
+	//   2: 2 -> 3, 2 minutes
+	//   3: 1 -> 3, 8 minutes (parallel route, reaches exactly at deadline 10)
+	//   4: 1 -> 1, self-loop, never propagates
+	// Release 0@0 and a later release 2@9; the later release cannot get past
+	// the deadline when pipe 2 remains the only downstream route.
+	req := incidentRequest{
+		N: 4,
+		Pipes: []pipe{
+			{0, 1, 2}, {1, 2, 2}, {2, 3, 2}, {1, 3, 8}, {1, 1, 1},
+		},
+		Releases: []release{{0, 0}, {2, 9}},
+		Intakes:  []int64{3},
+		Deadline: 10,
+	}
+	id := createIncident("incident: create shutdown-preview event", req)
+	if id == "" {
+		return
+	}
+
+	// At minute 0, closing pipe 0 blocks the traversal beginning exactly at the
+	// shutdown minute; only the release itself is present in both plans.
+	st, body, err := shutdownPreview(id, []int64{0})
+	if err != nil || st != http.StatusOK {
+		fail("incident: shutdown preview at minute 0", "status=%d err=%v body=%s", st, err, body)
+		return
+	}
+	var previewAtZero shutdownPreviewResponse
+	if err := json.Unmarshal(body, &previewAtZero); err != nil || previewAtZero.EventMinute != 0 {
+		fail("incident: shutdown preview at minute 0", "%v %s", err, body)
+		return
+	}
+	if _, reached := previewAtZero.Shutdown.EarliestArrivals["1"]; reached {
+		fail("incident: departure exactly at shutdown minute is blocked", "map=%v", previewAtZero.Shutdown.EarliestArrivals)
+		return
+	}
+	pass("incident: closure blocks departures starting at the current minute")
+
+	if res := advance(id, 2); res.status != http.StatusOK {
+		fail("incident: advance preview event to minute 2", "status=%d body=%s", res.status, res.body)
+		return
+	}
+
+	// Closing pipe 1 at minute 2 blocks the 1->2 traversal that would start at
+	// that exact minute. The parallel pipe 3 still reaches intake 3 at minute
+	// 10, so the intake is not protected and the deadline boundary breaches.
+	st, body, err = shutdownPreview(id, []int64{1})
+	if err != nil || st != http.StatusOK {
+		fail("incident: shutdown preview exact-minute block", "status=%d err=%v body=%s", st, err, body)
+		return
+	}
+	var exact shutdownPreviewResponse
+	if err := json.Unmarshal(body, &exact); err != nil {
+		fail("incident: shutdown preview exact-minute block", "%v %s", err, body)
+		return
+	}
+	if exact.EventMinute != 2 || exact.Snapshot.CurrentMinute != 2 || exact.Snapshot.Status != "propagating" {
+		fail("incident: preview records its event snapshot", "got=%+v", exact)
+		return
+	}
+	if exact.Shutdown.Status != "breached" || exact.Shutdown.EarliestArrivals["3"] != 10 {
+		fail("incident: parallel pipe reaches intake exactly at deadline", "plan=%+v", exact.Shutdown)
+		return
+	}
+	if exact.Shutdown.EarliestArrivals["2"] != 9 {
+		fail("incident: future release still seeds node 2 while the selected pipe blocks earlier travel", "map=%v", exact.Shutdown.EarliestArrivals)
+		return
+	}
+	changeNode2 := exact.ArrivalChanges[0]
+	if changeNode2.Node != 2 || changeNode2.OriginalArrival == nil || *changeNode2.OriginalArrival != 4 ||
+		changeNode2.ShutdownArrival == nil || *changeNode2.ShutdownArrival != 9 {
+		fail("incident: node arrival change at exact-minute closure", "got=%+v", changeNode2)
+		return
+	}
+	conclusion := exact.IntakeConclusions[0]
+	if conclusion.Node != 3 || conclusion.ShutdownProtected || conclusion.ShutdownArrival == nil ||
+		*conclusion.OriginalArrival != 6 || *conclusion.ShutdownArrival != 10 {
+		fail("incident: intake conclusion compares earliest arrivals and deadline", "got=%+v", conclusion)
+		return
+	}
+	pass("incident: exact-minute closure, parallel route and deadline boundary are exact")
+
+	// Closing both downstream routes protects the intake. The future release at
+	// node 2 remains effective, but its only path reaches after the deadline.
+	st, body, err = shutdownPreview(id, []int64{1, 3})
+	if err != nil || st != http.StatusOK {
+		fail("incident: protected shutdown preview", "status=%d err=%v body=%s", st, err, body)
+		return
+	}
+	var protected shutdownPreviewResponse
+	if err := json.Unmarshal(body, &protected); err != nil {
+		fail("incident: protected shutdown preview", "%v %s", err, body)
+		return
+	}
+	if !protected.AllIntakesProtected || protected.Shutdown.Status != "contained" {
+		fail("incident: future release cannot bypass closed pipes", "response=%+v", protected)
+		return
+	}
+	// A self-loop selected by its own index has no propagation effect.
+	st, body, err = shutdownPreview(id, []int64{1, 3, 4})
+	if err != nil || st != http.StatusOK {
+		fail("incident: self-loop shutdown preview", "status=%d err=%v body=%s", st, err, body)
+		return
+	}
+	var selfLoop shutdownPreviewResponse
+	if err := json.Unmarshal(body, &selfLoop); err != nil || !selfLoop.AllIntakesProtected {
+		fail("incident: self-loop selected by index does not propagate", "%v %s", err, body)
+		return
+	}
+	pass("incident: parallel indices are independent and self-loop closure is harmless")
+
+	// On a fresh event advanced to minute 3, the 1->2 packet already entered at
+	// minute 2. Closing pipe 1 now must not erase that in-flight traversal.
+	inflightID := createIncident("incident: create in-flight preview event", req)
+	if inflightID == "" {
+		return
+	}
+	if res := advance(inflightID, 3); res.status != http.StatusOK {
+		fail("incident: advance in-flight event", "status=%d body=%s", res.status, res.body)
+		return
+	}
+	st, body, err = shutdownPreview(inflightID, []int64{1})
+	if err != nil || st != http.StatusOK {
+		fail("incident: in-flight preview", "status=%d err=%v body=%s", st, err, body)
+		return
+	}
+	var inflight shutdownPreviewResponse
+	if err := json.Unmarshal(body, &inflight); err != nil {
+		fail("incident: in-flight preview", "%v %s", err, body)
+		return
+	}
+	if inflight.EventMinute != 3 || inflight.Shutdown.EarliestArrivals["2"] != 4 ||
+		inflight.Shutdown.EarliestArrivals["3"] != 6 || inflight.Shutdown.Status != "breached" {
+		fail("incident: pollution already in a pipe arrives unchanged", "response=%+v", inflight)
+		return
+	}
+	pass("incident: closures do not rewrite traversals that began before the event minute")
+
+	// Read-only: the original clock and first-arrival record still advance on
+	// the original plan.
+	if res := advance(id, 6); res.status != http.StatusOK {
+		fail("incident: original advance after preview", "status=%d body=%s", res.status, res.body)
+		return
+	}
+	var afterPreview advanceResponse
+	if err := json.Unmarshal(advance(id, 6).body, &afterPreview); err != nil || afterPreview.Snapshot.Status != "breached" {
+		fail("incident: preview leaves clock and first-arrival record unchanged", "response=%+v", afterPreview)
+		return
+	}
+	pass("incident: shutdown preview is read-only")
+}
+
 func verifyErrors() {
 	// Unknown incident -> 404 (unknown id checked before the body).
 	status, body, err := postJSON("/incidents/inc_does_not_exist/advance", advanceRequest{Minute: 1})
@@ -544,6 +736,40 @@ func verifyErrors() {
 		// Failed request left the clock untouched.
 		checkStep("incident: snapshot unchanged after invalid advance", id, 2, "propagating",
 			[]arrival{{0, 0}, {1, 1}})
+	}
+
+	previewReq := incidentRequest{
+		N:        2,
+		Pipes:    []pipe{{0, 1, 1}},
+		Releases: []release{{0, 2}},
+		Intakes:  []int64{1},
+		Deadline: 3,
+	}
+	previewID := createIncident("incident: create event for preview validation", previewReq)
+	if previewID != "" {
+		if res := advance(previewID, 1); res.status != http.StatusOK {
+			fail("incident: preview validation setup", "status=%d body=%s", res.status, res.body)
+		}
+		expect422Raw("incident: preview out-of-range pipe index", "/incidents/"+previewID+"/shutdown-preview",
+			[]byte(`{"closed_pipe_indices":[1]}`))
+		expect422Raw("incident: preview duplicate pipe index", "/incidents/"+previewID+"/shutdown-preview",
+			[]byte(`{"closed_pipe_indices":[0,0]}`))
+		expect422Raw("incident: preview unknown field", "/incidents/"+previewID+"/shutdown-preview",
+			[]byte(`{"closed_pipe_indices":[0],"x":1}`))
+		if res := advance(previewID, 3); res.status != http.StatusOK {
+			fail("incident: terminal preview setup", "status=%d body=%s", res.status, res.body)
+		}
+		st, body, err := shutdownPreview(previewID, []int64{0})
+		if err != nil || st != http.StatusConflict {
+			fail("incident: terminal preview rejected", "status=%d err=%v body=%s", st, err, body)
+		} else {
+			var er errorResponse
+			if json.Unmarshal(body, &er) != nil || er.Error.Code != "incident_terminal" {
+				fail("incident: terminal preview rejected", "body=%s", body)
+			} else {
+				pass("incident: terminal event rejects shutdown preview with 409")
+			}
+		}
 	}
 }
 
@@ -829,6 +1055,7 @@ func main() {
 	verifyIncidentLifecycle()
 	verifyContained()
 	verifyMultiSource()
+	verifyShutdownPreview()
 	verifyErrors()
 	verifyConcurrentAdvances()
 	verifyLargeIncident()

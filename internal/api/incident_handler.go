@@ -36,6 +36,13 @@ type AdvanceRequest struct {
 	Minute int64 `json:"minute"`
 }
 
+// ShutdownPreviewRequest is the payload accepted by
+// POST /incidents/{id}/shutdown-preview. Indices identify pipes by their
+// zero-based position in the array supplied when the incident was created.
+type ShutdownPreviewRequest struct {
+	ClosedPipeIndices []int64 `json:"closed_pipe_indices"`
+}
+
 // ArrivalDTO is a node reached for the first time at a given minute.
 type ArrivalDTO struct {
 	Node     int64 `json:"node"`
@@ -62,6 +69,42 @@ type CreateIncidentResponse struct {
 type AdvanceResponse struct {
 	NewArrivals []ArrivalDTO `json:"new_arrivals"`
 	Snapshot    SnapshotDTO  `json:"snapshot"`
+}
+
+// PlanProjectionDTO compares the original and hypothetical plans through the
+// deadline.
+type PlanProjectionDTO struct {
+	Status           string           `json:"status"`
+	EarliestArrivals map[string]int64 `json:"earliest_arrivals"`
+}
+
+// ArrivalChangeDTO lists one node whose earliest arrival changes under the
+// hypothetical closure. Null means the node is not reached by the deadline.
+type ArrivalChangeDTO struct {
+	Node            int64  `json:"node"`
+	OriginalArrival *int64 `json:"original_arrival_minute"`
+	ShutdownArrival *int64 `json:"shutdown_arrival_minute"`
+}
+
+// IntakeConclusionDTO is the protection result for one key intake.
+type IntakeConclusionDTO struct {
+	Node              int64  `json:"node"`
+	OriginalArrival   *int64 `json:"original_arrival_minute"`
+	ShutdownArrival   *int64 `json:"shutdown_arrival_minute"`
+	ShutdownProtected bool   `json:"shutdown_protected"`
+}
+
+// ShutdownPreviewResponse is a read-only what-if result based on one committed
+// event minute and snapshot.
+type ShutdownPreviewResponse struct {
+	EventMinute         int64                 `json:"event_minute"`
+	Snapshot            SnapshotDTO           `json:"snapshot"`
+	ClosedPipeIndices   []int64               `json:"closed_pipe_indices"`
+	Original            PlanProjectionDTO     `json:"original_plan"`
+	Shutdown            PlanProjectionDTO     `json:"shutdown_plan"`
+	ArrivalChanges      []ArrivalChangeDTO    `json:"arrival_changes"`
+	IntakeConclusions   []IntakeConclusionDTO `json:"intake_conclusions"`
+	AllIntakesProtected bool                  `json:"all_intakes_protected"`
 }
 
 // snapshotDTO converts a domain snapshot into the JSON shape, emitting
@@ -171,6 +214,92 @@ func (s *server) handleAdvance(w http.ResponseWriter, r *http.Request) {
 		dto = append(dto, ArrivalDTO{Node: int64(a.Node), AtMinute: a.AtMinute})
 	}
 	writeJSON(w, http.StatusOK, AdvanceResponse{NewArrivals: dto, Snapshot: snapshotDTO(snap)})
+}
+
+func (s *server) handleShutdownPreview(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "use POST")
+		return
+	}
+	id := r.PathValue("id")
+	in, exists := s.incidents.Get(id)
+	if !exists {
+		writeError(w, http.StatusNotFound, "not_found", fmt.Sprintf("incident %q does not exist", id))
+		return
+	}
+	var req ShutdownPreviewRequest
+	if !decodeStrict(w, r, &req) {
+		return
+	}
+	indices := make([]int, 0, len(req.ClosedPipeIndices))
+	for _, idx := range req.ClosedPipeIndices {
+		if idx < 0 {
+			writeError(w, http.StatusUnprocessableEntity, "invalid_input",
+				fmt.Sprintf("closed pipe index %d is out of range", idx))
+			return
+		}
+		indices = append(indices, int(idx))
+	}
+	preview, err := in.PreviewShutdown(indices)
+	if err != nil {
+		var ve *incident.ValidationError
+		if errors.As(err, &ve) {
+			writeError(w, http.StatusUnprocessableEntity, "invalid_input", ve.Msg)
+			return
+		}
+		var ce *incident.ConflictError
+		detail := err.Error()
+		if errors.As(err, &ce) {
+			detail = ce.Detail
+		}
+		if errors.Is(err, incident.ErrTerminal) {
+			writeError(w, http.StatusConflict, "incident_terminal", detail)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "internal_error", "shutdown preview failed")
+		return
+	}
+
+	closed := make([]int64, 0, len(preview.ClosedPipeIndices))
+	for _, idx := range preview.ClosedPipeIndices {
+		closed = append(closed, int64(idx))
+	}
+	changes := make([]ArrivalChangeDTO, 0, len(preview.ArrivalChanges))
+	for _, c := range preview.ArrivalChanges {
+		changes = append(changes, ArrivalChangeDTO{
+			Node:            int64(c.Node),
+			OriginalArrival: c.OriginalArrival,
+			ShutdownArrival: c.ShutdownArrival,
+		})
+	}
+	conclusions := make([]IntakeConclusionDTO, 0, len(preview.IntakeConclusions))
+	for _, c := range preview.IntakeConclusions {
+		conclusions = append(conclusions, IntakeConclusionDTO{
+			Node:              int64(c.Node),
+			OriginalArrival:   c.OriginalArrival,
+			ShutdownArrival:   c.ShutdownArrival,
+			ShutdownProtected: c.ShutdownProtected,
+		})
+	}
+	writeJSON(w, http.StatusOK, ShutdownPreviewResponse{
+		EventMinute:         preview.EventMinute,
+		Snapshot:            snapshotDTO(preview.Snapshot),
+		ClosedPipeIndices:   closed,
+		Original:            planDTO(preview.Original),
+		Shutdown:            planDTO(preview.Shutdown),
+		ArrivalChanges:      changes,
+		IntakeConclusions:   conclusions,
+		AllIntakesProtected: preview.AllIntakesProtected,
+	})
+}
+
+func planDTO(p incident.PlanProjection) PlanProjectionDTO {
+	arrivals := make(map[string]int64, len(p.EarliestArrivals))
+	for node, minute := range p.EarliestArrivals {
+		arrivals[fmt.Sprintf("%d", node)] = minute
+	}
+	return PlanProjectionDTO{Status: string(p.Status), EarliestArrivals: arrivals}
 }
 
 // buildSpec converts the request into a domain spec; it reports a stable 422

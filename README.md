@@ -7,6 +7,9 @@
 2. **污染传播事件**：给定管网（管道有向通行分钟）、多个污染源与各自释放分钟、
    重点取水口与截止分钟，事件时钟可分段推进，返回本次首次到达节点、累计最早
    到达分钟与状态（`POST /incidents`、`POST /incidents/{id}/advance`）。
+3. **只读关管预演**：在事件当前快照下，立即关闭创建事件时按下标指定的若干
+   管道，预演到截止分钟时原方案与关管方案的最早到达分钟及取水口结论
+   （`POST /incidents/{id}/shutdown-preview`）。
 
 ## 算法
 
@@ -98,7 +101,8 @@ curl -s -X POST http://localhost:8080/mincut \
 1. **屏障（accepting → draining）**：共享准入器（`internal/lifecycle`）在同一把
    锁下裁决"状态切换"与"租约授予"，二者构成同一线性化点。屏障前已取得租约的
    请求**完整执行到底**（即使请求体尚未发完）；屏障后的业务请求
-   （`/mincut`、`/incidents`、`/incidents/{id}/advance`）不再进入处理器、不改变
+   （`/mincut`、`/incidents`、`/incidents/{id}/advance`、
+   `/incidents/{id}/shutdown-preview`）不再进入处理器、不改变
    任何事件，稳定返回 `503 {"error":{"code":"draining",...}}`。`/healthz` 与
    `/readyz` 旁路准入器。
 2. **归零 → 关闭（draining → stopped）**：在 `DRAIN_TIMEOUT`（Go 时长或裸秒数，
@@ -208,6 +212,54 @@ curl -s -X POST http://localhost:8080/incidents/<id>/advance \
 # => new_arrivals 3@8，status=breached
 ```
 
+### `POST /incidents/{id}/shutdown-preview`
+
+只读关管预演。请求体用创建事件时 `pipes` 数组的**零基下标**指定立即关闭的
+管道：
+
+```json
+{"closed_pipe_indices": [1, 3]}
+```
+
+预演在一次事件锁内取得当前已提交快照，并在整次计算中固定使用其中的
+`current_minute`、传播状态与已到达节点；请求不会推进时钟，也不会改变首次到达
+记录。返回：
+
+- `event_minute` 与 `snapshot`：本次预演依据的事件分钟和事件快照；
+- `original_plan` / `shutdown_plan`：原方案与关管方案在截止分钟内的状态、每个
+  节点最早到达分钟；
+- `arrival_changes`：按节点编号升序列出最早到达分钟发生变化的节点，
+  `null` 表示截止分钟内不可达；
+- `intake_conclusions`：每个重点取水口在两种方案下的最早到达分钟及
+  `shutdown_protected`；
+- `all_intakes_protected`：关管方案截止分钟内是否保护全部重点取水口。
+
+**关管边界**：关闭只阻止在 `event_minute` 及之后**开始进入**的通行。若污染已
+在 `event_minute` 之前进入某条管道，即使该管道在请求中被关闭，污染仍按原通行
+时间抵达。未来分钟的释放源照常生效；关闭后污染可从未关闭管道继续传播。平行管
+按各自数组下标独立关闭；自环下标可以指定，但自环从不参与传播。恰在
+`event_minute` 出发的通行会被阻止；恰在 `deadline` 到达取水口仍为 `breached`。
+
+错误：未知事件 `404 not_found`；重复或越界管道下标、非法请求体为 `422`
+（`invalid_input` / `invalid_json`）；终态事件拒绝预演，返回
+`409 incident_terminal`。并发预演和并发推进由同一事件锁串行化，每次响应只包含
+获取快照那一刻的一份状态，不会把两次状态拼接。
+
+```json
+{
+  "event_minute": 3,
+  "snapshot": {"current_minute": 3, "status": "propagating", "earliest_arrivals": {"0": 0, "1": 2}},
+  "closed_pipe_indices": [1],
+  "original_plan": {"status": "breached", "earliest_arrivals": {"0": 0, "1": 2, "2": 4, "3": 6}},
+  "shutdown_plan": {"status": "breached", "earliest_arrivals": {"0": 0, "1": 2, "2": 4, "3": 6}},
+  "arrival_changes": [],
+  "intake_conclusions": [
+    {"node": 3, "original_arrival_minute": 6, "shutdown_arrival_minute": 6, "shutdown_protected": false}
+  ],
+  "all_intakes_protected": false
+}
+```
+
 ## 验收内容（verify 服务）
 
 `cmd/verify` 是黑盒验收客户端，只调用真实 HTTP 接口（无假接口、无固定
@@ -220,6 +272,8 @@ curl -s -X POST http://localhost:8080/incidents/<id>/advance \
   超时**内返回精确结果；
 - 污染事件：创建返回标识与初始快照，**分段推进**的精确到达分钟、首次到达
   增量与累计最早到达分钟；平行管取更早路径、自环与反向边不传播；
+- **只读关管预演**：精确检查在途污染、恰在关管分钟出发、未来释放、平行管
+  各自下标、自环与截止边界；响应标明事件分钟、节点到达变化与取水口结论；
 - 同分钟重试返回空增量与相同快照；倒退 / 越过截止 / 终态推进均为稳定 `409`
   且失败不改变快照；未知事件为 `404`；
 - **并发推进**：15 个乱序目标分钟并发提交只能单调串行生效，20 个同分钟

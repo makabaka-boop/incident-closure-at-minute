@@ -64,8 +64,9 @@ func NewMux() http.Handler {
 }
 
 // NewMuxWithGate builds the HTTP routing table sharing the given admission
-// gate. Business routes (/mincut, /incidents, /incidents/{id}/advance) are
-// wrapped by the barrier; the /healthz and /readyz probes bypass it.
+// gate. Business routes (/mincut, /incidents, /incidents/{id}/advance and
+// /incidents/{id}/shutdown-preview) are wrapped by the barrier; the /healthz
+// and /readyz probes bypass it.
 func NewMuxWithGate(g *lifecycle.Gate) http.Handler {
 	mux := http.NewServeMux()
 	s := &server{incidents: incident.NewStore(), gate: g}
@@ -74,6 +75,7 @@ func NewMuxWithGate(g *lifecycle.Gate) http.Handler {
 	mux.HandleFunc("/readyz", s.handleReadyz)
 	mux.HandleFunc("/incidents", s.admit(s.handleCreateIncident))
 	mux.HandleFunc("/incidents/{id}/advance", s.admit(s.handleAdvance))
+	mux.HandleFunc("/incidents/{id}/shutdown-preview", s.admit(s.handleShutdownPreview))
 	return mux
 }
 

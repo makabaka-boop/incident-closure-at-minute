@@ -467,6 +467,313 @@ func TestConcurrentSameMinuteRetries(t *testing.T) {
 	}
 }
 
+func TestShutdownPreviewInFlightAndExactMinute(t *testing.T) {
+	// 0@0 -2-> 1 -2-> 2 -2-> 3(intake). Closing pipe 1 (1->2) at t=2 blocks
+	// the traversal that starts exactly at the shutdown minute. Closing at t=3
+	// is too late: it entered at t=2, so node 2 still arrives at 4. A future
+	// release at node 1 still cannot use the closed pipe.
+	spec := Spec{
+		N:        4,
+		Pipes:    []Pipe{{0, 1, 2}, {1, 2, 2}, {2, 3, 2}},
+		Releases: []Release{{0, 0}, {1, 8}},
+		Intakes:  []int{3},
+		Deadline: 12,
+	}
+
+	in := mustIncident(t, spec)
+	if _, _, err := in.Advance(2); err != nil {
+		t.Fatalf("advance(2): %v", err)
+	}
+	preview, err := in.PreviewShutdown([]int{1})
+	if err != nil {
+		t.Fatalf("preview at 2: %v", err)
+	}
+	if preview.EventMinute != 2 || preview.Snapshot.CurrentMinute != 2 {
+		t.Fatalf("preview based on %+v, want minute 2", preview.Snapshot)
+	}
+	if _, reached := preview.Shutdown.EarliestArrivals[2]; reached {
+		t.Fatalf("closed departure at t=2 was not blocked: %v", preview.Shutdown.EarliestArrivals)
+	}
+	if _, reached := preview.Shutdown.EarliestArrivals[3]; reached {
+		t.Fatalf("intake reached through a pipe closed before departure: %v", preview.Shutdown.EarliestArrivals)
+	}
+	if preview.Shutdown.Status != Contained || !preview.AllIntakesProtected {
+		t.Fatalf("preview=%+v, want contained and protected", preview)
+	}
+	if c := preview.IntakeConclusions[0]; !c.ShutdownProtected || c.ShutdownArrival != nil ||
+		c.OriginalArrival == nil || *c.OriginalArrival != 6 {
+		t.Fatalf("intake conclusion=%+v, want original arrival 6 and shutdown protection", c)
+	}
+	change := preview.ArrivalChanges[0]
+	if change.Node != 2 || change.OriginalArrival == nil || *change.OriginalArrival != 4 || change.ShutdownArrival != nil {
+		t.Fatalf("node 2 change=%+v, want 4 -> null", change)
+	}
+
+	in2 := mustIncident(t, spec)
+	if _, _, err := in2.Advance(3); err != nil {
+		t.Fatalf("advance(3): %v", err)
+	}
+	preview, err = in2.PreviewShutdown([]int{1})
+	if err != nil {
+		t.Fatalf("preview at 3: %v", err)
+	}
+	if got := preview.Shutdown.EarliestArrivals[3]; got != 6 {
+		t.Fatalf("in-flight closed pipe arrival=%d, want 6 (all=%v)", got, preview.Shutdown.EarliestArrivals)
+	}
+	if preview.Shutdown.Status != Breached || preview.AllIntakesProtected {
+		t.Fatalf("pipe entered before shutdown minute must still breach: %+v", preview)
+	}
+}
+
+func TestShutdownPreviewParallelPipes(t *testing.T) {
+	// Three parallel pipes 0->1 with lengths 2, 4 and 5. Their indices are
+	// independent; closing one leaves the others open.
+	spec := Spec{
+		N:        2,
+		Pipes:    []Pipe{{0, 1, 2}, {0, 1, 4}, {0, 1, 5}},
+		Releases: []Release{{0, 0}},
+		Intakes:  []int{1},
+		Deadline: 10,
+	}
+
+	in := mustIncident(t, spec)
+	// Preview at the initial minute 0: the release and shortest-pipe departure
+	// both happen exactly at the shutdown minute, so that pipe is blocked.
+	preview, err := in.PreviewShutdown([]int{0})
+	if err != nil {
+		t.Fatalf("preview: %v", err)
+	}
+	if got := preview.Shutdown.EarliestArrivals[1]; got != 4 {
+		t.Fatalf("closing index 0 arrival=%d, want 4 via index 1", got)
+	}
+	if change := preview.ArrivalChanges[0]; change.Node != 1 || *change.OriginalArrival != 2 || *change.ShutdownArrival != 4 {
+		t.Fatalf("parallel change=%+v, want 2 -> 4", change)
+	}
+	if preview.AllIntakesProtected {
+		t.Fatal("other parallel pipe remains open, so intake is not protected")
+	}
+
+	preview, err = in.PreviewShutdown([]int{1, 0})
+	if err != nil {
+		t.Fatalf("preview two parallel pipes: %v", err)
+	}
+	if got := preview.Shutdown.EarliestArrivals[1]; got != 5 {
+		t.Fatalf("closing indices 0 and 1 arrival=%d, want 5 via index 2", got)
+	}
+	preview, err = in.PreviewShutdown([]int{2, 1, 0})
+	if err != nil {
+		t.Fatalf("preview all parallels: %v", err)
+	}
+	if !preview.AllIntakesProtected || preview.Shutdown.Status != Contained {
+		t.Fatalf("all parallel pipes closed: %+v", preview)
+	}
+}
+
+func TestShutdownPreviewSelfLoopAndDeadlineBoundary(t *testing.T) {
+	// Indices 0 and 1 are self-loops and may be selected, but they do not
+	// participate in propagation. The real arrival is exactly at the deadline.
+	spec := Spec{
+		N:        2,
+		Pipes:    []Pipe{{0, 0, 1}, {1, 1, 1}, {0, 1, 5}},
+		Releases: []Release{{0, 5}},
+		Intakes:  []int{1},
+		Deadline: 10,
+	}
+	in := mustIncident(t, spec)
+	if _, _, err := in.Advance(6); err != nil {
+		t.Fatalf("advance: %v", err)
+	}
+	preview, err := in.PreviewShutdown([]int{0, 1})
+	if err != nil {
+		t.Fatalf("self-loop preview: %v", err)
+	}
+	if got := preview.Shutdown.EarliestArrivals[1]; got != 10 {
+		t.Fatalf("self-loops altered propagation: arrival=%d want 10", got)
+	}
+	if preview.Original.Status != Breached || preview.Shutdown.Status != Breached {
+		t.Fatalf("arrival exactly at deadline must breach both plans: %+v", preview)
+	}
+	if len(preview.ArrivalChanges) != 0 {
+		t.Fatalf("self-loop closures caused changes: %+v", preview.ArrivalChanges)
+	}
+}
+
+func TestShutdownPreviewRejectsInvalidAndTerminal(t *testing.T) {
+	spec := Spec{
+		N:        2,
+		Pipes:    []Pipe{{0, 1, 1}},
+		Releases: []Release{{0, 0}},
+		Intakes:  []int{1},
+		Deadline: 3,
+	}
+	in := mustIncident(t, spec)
+	for _, idx := range []int{1, -1} {
+		var ve *ValidationError
+		if _, err := in.PreviewShutdown([]int{idx}); !errors.As(err, &ve) {
+			t.Fatalf("index %d err=%v, want validation error", idx, err)
+		}
+	}
+	var ve *ValidationError
+	if _, err := in.PreviewShutdown([]int{0, 0}); !errors.As(err, &ve) {
+		t.Fatalf("duplicate index err=%v, want validation error", err)
+	}
+	if _, _, err := in.Advance(3); err != nil {
+		t.Fatalf("advance to terminal: %v", err)
+	}
+	if _, err := in.PreviewShutdown([]int{0}); !errors.Is(err, ErrTerminal) {
+		t.Fatalf("terminal preview err=%v, want incident_terminal", err)
+	}
+	if snap := in.Snapshot(); snap.CurrentMinute != 3 || snap.Status != Breached {
+		t.Fatalf("preview mutated terminal snapshot: %+v", snap)
+	}
+}
+
+// TestShutdownPreviewOracle compares the implementation against a direct
+// minute-by-minute simulator on many small random graphs. The simulator treats
+// a closure time as the linearization minute: departures before that minute
+// remain in flight, while departures at or after that minute cannot enter the
+// selected pipes.
+func TestShutdownPreviewOracle(t *testing.T) {
+	state := uint64(20260924)
+	next := func(mod uint64) uint64 {
+		state = state*6364136223846793005 + 1442695040888963407
+		return (state >> 11) % mod
+	}
+	for iter := 0; iter < 300; iter++ {
+		n := int(2 + next(5))
+		pipeCount := int(next(8))
+		pipes := make([]Pipe, 0, pipeCount)
+		for len(pipes) < pipeCount {
+			from := int(next(uint64(n)))
+			to := int(next(uint64(n)))
+			// Keep most arcs non-self-loop; self-loops are covered separately.
+			if from == to && next(3) != 0 {
+				continue
+			}
+			pipes = append(pipes, Pipe{From: from, To: to, Minutes: int64(1 + next(4))})
+		}
+		deadline := int64(8 + next(5))
+		releaseNode := int(next(uint64(n)))
+		releaseAt := int64(next(uint64(deadline + 1)))
+		intake := int(next(uint64(n)))
+		spec := Spec{
+			N: n, Pipes: pipes,
+			Releases: []Release{{Node: releaseNode, At: releaseAt}},
+			Intakes:  []int{intake},
+			Deadline: deadline,
+		}
+		in := mustIncident(t, spec)
+		oracleOriginal := simulatePropagation(spec, nil, -1)
+		for v := 0; v < n; v++ {
+			want := int64(-1)
+			if d, ok := oracleOriginal[v]; ok && d <= deadline {
+				want = d
+			}
+			got := int64(-1)
+			if in.dist[v] <= deadline {
+				got = in.dist[v]
+			}
+			if got != want {
+				t.Fatalf("iter %d original dist[%d]=%d, oracle=%d spec=%+v", iter, v, got, want, spec)
+			}
+		}
+
+		for minute := int64(0); minute < deadline; minute++ {
+			inAtMinute := mustIncident(t, spec)
+			if _, _, err := inAtMinute.Advance(minute); err != nil {
+				t.Fatalf("iter %d advance %d: %v", iter, minute, err)
+			}
+			if inAtMinute.Snapshot().Status.Terminal() {
+				break
+			}
+			for pi := range pipes {
+				closed := []int{pi}
+				wantDist := simulatePropagation(spec, map[int]bool{pi: true}, minute)
+				preview, err := inAtMinute.PreviewShutdown(closed)
+				if err != nil {
+					t.Fatalf("iter %d preview minute=%d pipe=%d: %v", iter, minute, pi, err)
+				}
+				if preview.EventMinute != minute {
+					t.Fatalf("preview mixed event minute %d with request minute %d", preview.EventMinute, minute)
+				}
+				for v := 0; v < n; v++ {
+					want, hasWant := wantDist[v]
+					if hasWant && want > deadline {
+						hasWant = false
+					}
+					got, hasGot := preview.Shutdown.EarliestArrivals[v]
+					if hasWant != hasGot || (hasWant && got != want) {
+						t.Fatalf("iter %d minute=%d close=%d node=%d got=(%d,%v) want=(%d,%v)\nspec=%+v\nchanges=%+v",
+							iter, minute, pi, v, got, hasGot, want, hasWant, spec, preview.ArrivalChanges)
+					}
+				}
+			}
+		}
+	}
+}
+
+func simulatePropagation(spec Spec, closed map[int]bool, shutdownAt int64) map[int]int64 {
+	arrival := map[int]int64{}
+	type packet struct{ node, at int64 }
+	heap2 := make([]packet, 0)
+	less := func(i, j int) bool { return heap2[i].at < heap2[j].at }
+	push := func(p packet) {
+		heap2 = append(heap2, p)
+		for i := len(heap2) - 1; i > 0; {
+			parent := (i - 1) / 2
+			if less(parent, i) {
+				break
+			}
+			heap2[parent], heap2[i] = heap2[i], heap2[parent]
+			i = parent
+		}
+	}
+	pop := func() packet {
+		out := heap2[0]
+		last := len(heap2) - 1
+		heap2[0] = heap2[last]
+		heap2 = heap2[:last]
+		for i := 0; ; {
+			left, right, best := 2*i+1, 2*i+2, i
+			if left < len(heap2) && less(left, best) {
+				best = left
+			}
+			if right < len(heap2) && less(right, best) {
+				best = right
+			}
+			if best == i {
+				break
+			}
+			heap2[i], heap2[best] = heap2[best], heap2[i]
+			i = best
+		}
+		return out
+	}
+	for _, r := range spec.Releases {
+		push(packet{int64(r.Node), r.At})
+	}
+	for len(heap2) > 0 {
+		cur := pop()
+		if cur.at > spec.Deadline {
+			continue
+		}
+		if old, ok := arrival[int(cur.node)]; ok && old <= cur.at {
+			continue
+		}
+		arrival[int(cur.node)] = cur.at
+		for i, p := range spec.Pipes {
+			if p.From != int(cur.node) || p.From == p.To {
+				continue
+			}
+			if closed != nil && closed[i] && cur.at >= shutdownAt {
+				continue
+			}
+			push(packet{int64(p.To), cur.at + p.Minutes})
+		}
+	}
+	return arrival
+}
+
 func TestMaxInt64Unreachable(t *testing.T) {
 	spec := Spec{N: 2, Pipes: []Pipe{{1, 0, 1}}, Releases: []Release{{0, 0}}, Intakes: []int{1}, Deadline: 3}
 	in := mustIncident(t, spec)
